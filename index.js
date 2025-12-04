@@ -69,7 +69,7 @@ class TuyaDevice extends EventEmitter {
 
     // Check arguments
     if (!(isValidString(id) ||
-        isValidString(ip))) {
+      isValidString(ip))) {
       throw new TypeError('ID and IP are missing from device.');
     }
 
@@ -150,10 +150,11 @@ class TuyaDevice extends EventEmitter {
     const commandByte = this.device.version === '3.4' || this.device.version === '3.5' ? CommandType.DP_QUERY_NEW : CommandType.DP_QUERY;
 
     // Create byte buffer
+    const sequenceN = ++this._currentSequenceN;
     const buffer = this.device.parser.encode({
       data: payload,
       commandByte,
-      sequenceN: ++this._currentSequenceN
+      sequenceN
     });
 
     let data;
@@ -162,7 +163,7 @@ class TuyaDevice extends EventEmitter {
       debug('GET Payload:');
       debug(payload);
 
-      data = await this._send(buffer);
+      data = await this._send(buffer, sequenceN);
     }
 
     // If data read failed with defined error messages or device uses Protocol 3.2 we need to read differently
@@ -249,7 +250,7 @@ class TuyaDevice extends EventEmitter {
     return new Promise((resolve, reject) => {
       this._expectRefreshResponseForSequenceN = sequenceN;
       // Send request
-      this._send(buffer).then(async data => {
+      this._send(buffer, sequenceN).then(async data => {
         if (data === 'json obj data unvalid') {
           // Some devices don't respond to DP_QUERY so, for DPS get commands, fall
           // back to using SEND with null value. This appears to always work as
@@ -421,7 +422,7 @@ class TuyaDevice extends EventEmitter {
         }
 
         // Send request
-        this._send(buffer).catch(error => {
+        this._send(buffer, sequenceN).catch(error => {
           if (options.shouldWaitForResponse && !resolvedOrRejected) {
             resolvedOrRejected = true;
             reject(error);
@@ -470,8 +471,8 @@ class TuyaDevice extends EventEmitter {
    * @param {Buffer} buffer buffer of data
    * @returns {Promise<any>} returned data for request
    */
-  _send(buffer) {
-    const sequenceNo = this._currentSequenceN;
+  _send(buffer, expectedSequenceNo) {
+    const sequenceNo = typeof expectedSequenceNo !== 'undefined' ? expectedSequenceNo : this._currentSequenceN;
     // Retry up to 5 times
     return pRetry(() => {
       return new Promise((resolve, reject) => {
@@ -480,8 +481,24 @@ class TuyaDevice extends EventEmitter {
           try {
             this.client.write(buffer);
 
-            // Add resolver function
-            this._resolvers[sequenceNo] = data => resolve(data);
+            // Add resolver function with a timeout cleanup
+            let timer = null;
+            this._resolvers[sequenceNo] = data => {
+              if (timer) clearTimeout(timer);
+              resolve(data);
+            };
+            // Setup timeout to clean up unresolved resolvers
+            timer = setTimeout(() => {
+              if (this._resolvers[sequenceNo]) {
+                delete this._resolvers[sequenceNo];
+                this.emit(
+                  'error',
+                  'Timeout waiting for status response from device id: ' + this.device.id
+                );
+                reject(new Error('Timeout waiting for status response from device id: ' + this.device.id));
+              }
+            }, this._responseTimeout * 2500);
+
           } catch (error) {
             reject(error);
           }
@@ -820,6 +837,15 @@ class TuyaDevice extends EventEmitter {
         packet.commandByte === CommandType.CONTROL_NEW
       ) && packet.payload === false) {
       debug('Got SET ack.');
+      // If there's a waiting set resolver, resolve it with the ack
+      if (typeof this._setResolver === 'function') {
+        debug('Resolving setResolver with CONTROL ack');
+        this._setResolver(packet.payload);
+        this._setResolver = undefined;
+        this._setResolveAllowGet = undefined;
+        delete this._resolvers[packet.sequenceN];
+        this._expectRefreshResponseForSequenceN = undefined;
+      }
       return;
     }
 
@@ -916,6 +942,16 @@ class TuyaDevice extends EventEmitter {
       return;
     }
 
+    // DP_QUERY response to GET request - resolve by sequence number
+    if (packet.commandByte === CommandType.DP_QUERY && packet.sequenceN in this._resolvers) {
+      this._resolvers[packet.sequenceN](packet.payload);
+
+      // Remove resolver
+      delete this._resolvers[packet.sequenceN];
+      this._expectRefreshResponseForSequenceN = undefined;
+      return;
+    }
+
     // Call data resolver for sequence number
     if (packet.sequenceN in this._resolvers) {
       this._resolvers[packet.sequenceN](packet.payload);
@@ -995,7 +1031,7 @@ class TuyaDevice extends EventEmitter {
    */
   find({timeout = 10, all = false} = {}) {
     if (isValidString(this.device.id) &&
-        isValidString(this.device.ip)) {
+      isValidString(this.device.ip)) {
       // Don't need to do anything
       debug('IP and ID are already both resolved.');
       return Promise.resolve(true);
@@ -1054,8 +1090,8 @@ class TuyaDevice extends EventEmitter {
       }
 
       if (!all &&
-          (this.device.id === thisID || this.device.ip === thisIP) &&
-          dataRes.payload) {
+        (this.device.id === thisID || this.device.ip === thisIP) &&
+        dataRes.payload) {
         // Add IP
         this.device.ip = dataRes.payload.ip;
 
